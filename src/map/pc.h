@@ -28,6 +28,7 @@
 #include "map/log.h" // struct e_log_pick_type
 #include "map/map.h" // RC_MAX, ELE_MAX
 #include "map/pc_groups.h" // GroupSettings
+#include "map/rodex.h"
 #include "map/script.h" // struct reg_db
 #include "map/searchstore.h"  // struct s_search_store_info
 #include "map/status.h" // enum sc_type, OPTION_*
@@ -499,6 +500,14 @@ END_ZEROED_BLOCK;
 		bool changed; // if true, should sync with charserver on next mailbox request
 	} mail;
 
+	// RoDEX
+	struct {
+		struct rodex_message tmp;
+		struct rodex_maillist messages;
+		int total;
+		bool new_mail;
+	} rodex;
+
 	// Quest log system
 	int num_quests;          ///< Number of entries in quest_log
 	int avail_quests;        ///< Number of Q_ACTIVE and Q_INACTIVE entries in quest log (index of the first Q_COMPLETE entry)
@@ -859,6 +868,7 @@ END_ZEROED_BLOCK; /* End */
 
 	int (*isequip) (struct map_session_data *sd,int n);
 	int (*equippoint) (struct map_session_data *sd,int n);
+	int (*item_equippoint) (struct map_session_data *sd, struct item_data* id);
 	int (*setinventorydata) (struct map_session_data *sd);
 
 	int (*checkskill) (struct map_session_data *sd,uint16 skill_id);
@@ -1095,6 +1105,7 @@ END_ZEROED_BLOCK; /* End */
 	bool (*db_checkid) (int class);
 
 	void (*validate_levels) (void);
+	void (*update_job_and_level) (struct map_session_data *sd);
 
 	/**
 	 * Autotrade persistency [Ind/Hercules <3]

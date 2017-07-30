@@ -46,6 +46,7 @@
 #include "map/pc.h"
 #include "map/pet.h"
 #include "map/quest.h"
+#include "map/rodex.h"
 #include "map/script.h"
 #include "map/skill.h"
 #include "map/status.h"
@@ -2442,7 +2443,9 @@ void clif_addcards2(unsigned short *cards, struct item* item) {
 /// 02d4 <index>.W <amount>.W <name id>.W <identified>.B <damaged>.B <refine>.B <card1>.W <card2>.W <card3>.W <card4>.W <equip location>.W <item type>.B <result>.B <expire time>.L <bindOnEquipType>.W (ZC_ITEM_PICKUP_ACK3)
 /// 0990 <index>.W <amount>.W <name id>.W <identified>.B <damaged>.B <refine>.B <card1>.W <card2>.W <card3>.W <card4>.W <equip location>.L <item type>.B <result>.B <expire time>.L <bindOnEquipType>.W (ZC_ITEM_PICKUP_ACK_V5)
 /// 0a0c <index>.W <amount>.W <name id>.W <identified>.B <damaged>.B <refine>.B <card1>.W <card2>.W <card3>.W <card4>.W <equip location>.L <item type>.B <result>.B <expire time>.L <bindOnEquipType>.W (ZC_ITEM_PICKUP_ACK_V6)
-void clif_additem(struct map_session_data *sd, int n, int amount, int fail) {
+/// 0a37 <index>.W <amount>.W <name id>.W <identified>.B <damaged>.B <refine>.B <card1>.W <card2>.W <card3>.W <card4>.W <equip location>.L <item type>.B <result>.B <expire time>.L <bindOnEquipType>.W <favorite>.B <view id>.W (ZC_ITEM_PICKUP_ACK_V7)
+void clif_additem(struct map_session_data *sd, int n, int amount, int fail)
+{
 	struct packet_additem p;
 	nullpo_retv(sd);
 
@@ -2482,6 +2485,10 @@ void clif_additem(struct map_session_data *sd, int n, int amount, int fail) {
 #endif
 #if PACKETVER >= 20150226
 		clif->add_item_options(&p.option_data[0], &sd->status.inventory[n]);
+#endif
+#if PACKETVER >= 20160921
+		p.favorite = sd->status.inventory[n].favorite;
+		p.look = sd->inventory_data[n]->look;
 #endif
 	}
 	p.result = (unsigned char)fail;
@@ -2978,13 +2985,6 @@ void clif_updatestatus(struct map_session_data *sd,int type)
 			break;
 		case SP_HP:
 			WFIFOL(fd,4)=sd->battle_status.hp;
-			// TODO: Won't these overwrite the current packet?
-			if( map->list[sd->bl.m].hpmeter_visible )
-				clif->hpmeter(sd);
-			if( !battle_config.party_hp_mode && sd->status.party_id )
-				clif->party_hp(sd);
-			if( sd->bg_id )
-				clif->bg_hp(sd);
 			break;
 		case SP_SP:
 			WFIFOL(fd,4)=sd->battle_status.sp;
@@ -3134,6 +3134,21 @@ void clif_updatestatus(struct map_session_data *sd,int type)
 			return;
 	}
 	WFIFOSET(fd,len);
+
+	// Additional update packets that should be sent right after
+	switch (type) {
+		case SP_BASELEVEL:
+			pc->update_job_and_level(sd);
+			break;
+		case SP_HP:
+			if (map->list[sd->bl.m].hpmeter_visible)
+				clif->hpmeter(sd);
+			if (!battle_config.party_hp_mode && sd->status.party_id)
+				clif->party_hp(sd);
+			if (sd->bg_id)
+				clif->bg_hp(sd);
+			break;
+	}
 }
 
 /// Notifies client of a parameter change of an another player (ZC_PAR_CHANGE_USER).
@@ -6345,10 +6360,13 @@ void clif_vendinglist(struct map_session_data* sd, unsigned int id, struct s_ven
 	const int offset = 12;
 #endif
 
-#if PACKETVER >= 20150226
+#if PACKETVER < 20150226
+	const int item_length = 22;
+// [4144] date 20160921 not confirmend. Can be bigger or smaller
+#elif PACKETVER < 20160921
 	const int item_length = 47;
 #else
-	const int item_length = 22;
+	const int item_length = 53;
 #endif
 
 	nullpo_retv(sd);
@@ -6380,6 +6398,11 @@ void clif_vendinglist(struct map_session_data* sd, unsigned int id, struct s_ven
 		clif->addcards(WFIFOP(fd,offset+14+i*item_length), &vsd->status.cart[index]);
 #if PACKETVER >= 20150226
 		clif->add_item_options(WFIFOP(fd, offset + 22 + i * item_length), &vsd->status.cart[index]);
+#endif
+// [4144] date 20160921 not confirmend. Can be bigger or smaller
+#if PACKETVER >= 20160921
+		WFIFOL(fd, offset + 47 + i * item_length) = pc->item_equippoint(sd, data);
+		WFIFOW(fd, offset + 51 + i * item_length) = data->look;
 #endif
 	}
 	WFIFOSET(fd,WFIFOW(fd,2));
@@ -6511,6 +6534,7 @@ void clif_party_created(struct map_session_data *sd,int result)
 /// Adds new member to a party.
 /// 0104 <account id>.L <role>.L <x>.W <y>.W <state>.B <party name>.24B <char name>.24B <map name>.16B (ZC_ADD_MEMBER_TO_GROUP)
 /// 01e9 <account id>.L <role>.L <x>.W <y>.W <state>.B <party name>.24B <char name>.24B <map name>.16B <item pickup rule>.B <item share rule>.B (ZC_ADD_MEMBER_TO_GROUP2)
+/// 0a43 <account id>.L <role>.L <class>.W <base level>.W <x>.W <y>.W <state>.B <party name>.24B <char name>.24B <map name>.16B <item pickup rule>.B <item share rule>.B (ZC_ADD_MEMBER_TO_GROUP3)
 /// role:
 ///     0 = leader
 ///     1 = normal
@@ -6519,35 +6543,50 @@ void clif_party_created(struct map_session_data *sd,int result)
 ///     1 = disconnected
 void clif_party_member_info(struct party_data *p, struct map_session_data *sd)
 {
-	unsigned char buf[81];
 	int i;
+#if PACKETVER < 20170502
+	unsigned char buf[81];
+	const int cmd = 0x1e9;
+	const int offset = 0;
+#else
+	unsigned char buf[85];
+// [4144] probably 0xa43 packet can works on older clients because in client was added in 2015-10-07
+	const int cmd = 0xa43;
+	int offset = 4;
+#endif
 
 	nullpo_retv(p);
 	nullpo_retv(sd);
 	if (!sd) { //Pick any party member (this call is used when changing item share rules)
-		ARR_FIND( 0, MAX_PARTY, i, p->data[i].sd != 0 );
+		ARR_FIND(0, MAX_PARTY, i, p->data[i].sd != 0);
 	} else {
-		ARR_FIND( 0, MAX_PARTY, i, p->data[i].sd == sd );
+		ARR_FIND(0, MAX_PARTY, i, p->data[i].sd == sd);
 	}
-	if (i >= MAX_PARTY) return; //Should never happen...
+	if (i >= MAX_PARTY)
+		return; //Should never happen...
 	sd = p->data[i].sd;
 
-	WBUFW(buf, 0) = 0x1e9;
+	WBUFW(buf, 0) = cmd;
 	WBUFL(buf, 2) = sd->status.account_id;
-	WBUFL(buf, 6) = (p->party.member[i].leader)?0:1;
-	WBUFW(buf,10) = sd->bl.x;
-	WBUFW(buf,12) = sd->bl.y;
-	WBUFB(buf,14) = (p->party.member[i].online)?0:1;
-	memcpy(WBUFP(buf,15), p->party.name, NAME_LENGTH);
-	memcpy(WBUFP(buf,39), sd->status.name, NAME_LENGTH);
-	mapindex->getmapname_ext(map->list[sd->bl.m].custom_name ? map->list[map->list[sd->bl.m].instance_src_map].name : map->list[sd->bl.m].name, WBUFP(buf,63));
-	WBUFB(buf,79) = (p->party.item&1)?1:0;
-	WBUFB(buf,80) = (p->party.item&2)?1:0;
-	clif->send(buf,packet_len(0x1e9),&sd->bl,PARTY);
+	WBUFL(buf, 6) = (p->party.member[i].leader) ? 0 : 1;
+#if PACKETVER >= 20170502
+	WBUFW(buf, 10) = sd->status.class;
+	WBUFW(buf, 12) = sd->status.base_level;
+#endif
+	WBUFW(buf, offset + 10) = sd->bl.x;
+	WBUFW(buf, offset + 12) = sd->bl.y;
+	WBUFB(buf, offset + 14) = (p->party.member[i].online) ? 0 : 1;
+	memcpy(WBUFP(buf, offset + 15), p->party.name, NAME_LENGTH);
+	memcpy(WBUFP(buf, offset + 39), sd->status.name, NAME_LENGTH);
+	mapindex->getmapname_ext(map->list[sd->bl.m].custom_name ? map->list[map->list[sd->bl.m].instance_src_map].name : map->list[sd->bl.m].name, WBUFP(buf, offset + 63));
+	WBUFB(buf, offset + 79) = (p->party.item & 1) ? 1 : 0;
+	WBUFB(buf, offset + 80) = (p->party.item & 2) ? 1 : 0;
+	clif->send(buf, packet_len(cmd), &sd->bl, PARTY);
 }
 
 /// Sends party information (ZC_GROUP_LIST).
 /// 00fb <packet len>.W <party name>.24B { <account id>.L <nick>.24B <map name>.16B <role>.B <state>.B }*
+/// 0a44 <packet len>.W <party name>.24B { <account id>.L <nick>.24B <map name>.16B <role>.B <state>.B <class>.W <base level>.W }* <item pickup rule>.B <item share rule>.B <unknown>.L
 /// role:
 ///     0 = leader
 ///     1 = normal
@@ -6556,35 +6595,76 @@ void clif_party_member_info(struct party_data *p, struct map_session_data *sd)
 ///     1 = disconnected
 void clif_party_info(struct party_data* p, struct map_session_data *sd)
 {
-	unsigned char buf[2+2+NAME_LENGTH+(4+NAME_LENGTH+MAP_NAME_LENGTH_EXT+1+1)*MAX_PARTY];
 	struct map_session_data* party_sd = NULL;
 	int i, c;
+#if PACKETVER < 20170502
+	const int cmd = 0xfb;
+	const int size = 46;
+	unsigned char buf[2 + 2 + NAME_LENGTH + 46 * MAX_PARTY];
+#else
+// [4144] probably 0xa44 packet can works on older clients because in client was added in 2015-10-07
+	const int cmd = 0xa44;
+	const int size = 50;
+	unsigned char buf[2 + 2 + NAME_LENGTH + 50 * MAX_PARTY + 6];
+#endif
 
 	nullpo_retv(p);
 
-	WBUFW(buf,0) = 0xfb;
-	memcpy(WBUFP(buf,4), p->party.name, NAME_LENGTH);
+	WBUFW(buf, 0) = cmd;
+	memcpy(WBUFP(buf, 4), p->party.name, NAME_LENGTH);
 	for(i = 0, c = 0; i < MAX_PARTY; i++)
 	{
-		struct party_member* m = &p->party.member[i];
-		if(!m->account_id) continue;
+		struct party_member *m = &p->party.member[i];
+		if (!m->account_id)
+			continue;
 
-		if(party_sd == NULL) party_sd = p->data[i].sd;
+		if (party_sd == NULL)
+			party_sd = p->data[i].sd;
 
-		WBUFL(buf,28+c*46) = m->account_id;
-		memcpy(WBUFP(buf,28+c*46+4), m->name, NAME_LENGTH);
-		mapindex->getmapname_ext(mapindex_id2name(m->map), WBUFP(buf,28+c*46+28));
-		WBUFB(buf,28+c*46+44) = (m->leader) ? 0 : 1;
-		WBUFB(buf,28+c*46+45) = (m->online) ? 0 : 1;
+		WBUFL(buf, 28 + c * size) = m->account_id;
+		memcpy(WBUFP(buf, 28 + c * size + 4), m->name, NAME_LENGTH);
+		mapindex->getmapname_ext(mapindex_id2name(m->map), WBUFP(buf, 28 + c * size + 28));
+		WBUFB(buf, 28 + c * size + 44) = (m->leader) ? 0 : 1;
+		WBUFB(buf, 28 + c * size + 45) = (m->online) ? 0 : 1;
+#if PACKETVER >= 20170502
+		WBUFW(buf, 28 + c * size + 46) = m->class;
+		WBUFW(buf, 28 + c * size + 48) = m->lv;
+#endif
 		c++;
 	}
-	WBUFW(buf,2) = 28+c*46;
+#if PACKETVER < 20170502
+	WBUFW(buf, 2) = 28 + c * size;
+#else
+	WBUFB(buf, 28 + c * size) = (p->party.item & 1) ? 1 : 0;
+	WBUFB(buf, 28 + c * size + 1) = (p->party.item & 2) ? 1 : 0;
+	WBUFL(buf, 28 + c * size + 2) = 0; // unknown
+	WBUFW(buf, 2) = 28 + c * size + 6;
+#endif
 
-	if(sd) { // send only to self
-		clif->send(buf, WBUFW(buf,2), &sd->bl, SELF);
+	if (sd) { // send only to self
+		clif->send(buf, WBUFW(buf, 2), &sd->bl, SELF);
 	} else if (party_sd) { // send to whole party
-		clif->send(buf, WBUFW(buf,2), &party_sd->bl, PARTY);
+		clif->send(buf, WBUFW(buf, 2), &party_sd->bl, PARTY);
 	}
+}
+
+/// Updates the job and level of a party member
+/// 0abd <account id>.L <job>.W <level>.W
+void clif_party_job_and_level(struct map_session_data *sd)
+{
+// [4144] packet 0xabd added in client in 2017-02-15 because this probably it can works for clients older than 20170502
+#if PACKETVER >= 20170502
+	unsigned char buf[10];
+
+	nullpo_retv(sd);
+
+	WBUFW(buf, 0) = 0xabd;
+	WBUFL(buf, 2) = sd->status.account_id;
+	WBUFW(buf, 6) = sd->status.class;
+	WBUFW(buf, 8) = sd->status.base_level;
+
+	clif_send(buf, packet_len(0xabd), &sd->bl, PARTY);
+#endif
 }
 
 /// The player's 'party invite' state, sent during login (ZC_PARTY_CONFIG).
@@ -7433,36 +7513,48 @@ void clif_guild_masterormember(struct map_session_data *sd)
 /// Guild basic information (Territories [Valaris])
 /// 0150 <guild id>.L <level>.L <member num>.L <member max>.L <exp>.L <max exp>.L <points>.L <honor>.L <virtue>.L <emblem id>.L <name>.24B <master name>.24B <manage land>.16B (ZC_GUILD_INFO)
 /// 01b6 <guild id>.L <level>.L <member num>.L <member max>.L <exp>.L <max exp>.L <points>.L <honor>.L <virtue>.L <emblem id>.L <name>.24B <master name>.24B <manage land>.16B <zeny>.L (ZC_GUILD_INFO2)
-void clif_guild_basicinfo(struct map_session_data *sd) {
+void clif_guild_basicinfo(struct map_session_data *sd)
+{
 	int fd;
 	struct guild *g;
+
+#if PACKETVER < 20160622
+	const int cmd = 0x1b6;  //0x150; [4144] this is packet for older versions?
+#else
+	const int cmd = 0xa84;
+#endif
 
 	nullpo_retv(sd);
 	fd = sd->fd;
 
-	if( (g = sd->guild) == NULL )
+	if ((g = sd->guild) == NULL)
 		return;
 
-	WFIFOHEAD(fd,packet_len(0x1b6));
-	WFIFOW(fd, 0)=0x1b6;//0x150;
-	WFIFOL(fd, 2)=g->guild_id;
-	WFIFOL(fd, 6)=g->guild_lv;
-	WFIFOL(fd,10)=g->connect_member;
-	WFIFOL(fd,14)=g->max_member;
-	WFIFOL(fd,18)=g->average_lv;
-	WFIFOL(fd,22)=(uint32)cap_value(g->exp,0,INT32_MAX);
-	WFIFOL(fd,26)=g->next_exp;
-	WFIFOL(fd,30)=0; // Tax Points
-	WFIFOL(fd,34)=0; // Honor: (left) Vulgar [-100,100] Famed (right)
-	WFIFOL(fd,38)=0; // Virtue: (down) Wicked [-100,100] Righteous (up)
-	WFIFOL(fd,42)=g->emblem_id;
-	memcpy(WFIFOP(fd,46),g->name, NAME_LENGTH);
-	memcpy(WFIFOP(fd,70),g->master, NAME_LENGTH);
+	WFIFOHEAD(fd, packet_len(cmd));
+	WFIFOW(fd, 0) = cmd;
+	WFIFOL(fd, 2) = g->guild_id;
+	WFIFOL(fd, 6) = g->guild_lv;
+	WFIFOL(fd, 10) = g->connect_member;
+	WFIFOL(fd, 14) = g->max_member;
+	WFIFOL(fd, 18) = g->average_lv;
+	WFIFOL(fd, 22) = (uint32)cap_value(g->exp, 0, INT32_MAX);
+	WFIFOL(fd, 26) = g->next_exp;
+	WFIFOL(fd, 30) = 0;  // Tax Points
+	WFIFOL(fd, 34) = 0;  // Honor: (left) Vulgar [-100,100] Famed (right)
+	WFIFOL(fd, 38) = 0;  // Virtue: (down) Wicked [-100,100] Righteous (up)
+	WFIFOL(fd, 42) = g->emblem_id;
+	memcpy(WFIFOP(fd, 46), g->name, NAME_LENGTH);
+#if PACKETVER < 20160622
+	memcpy(WFIFOP(fd, 70), g->master, NAME_LENGTH);
+	safestrncpy(WFIFOP(fd, 94), msg_sd(sd, 300 + guild->checkcastles(g)), 16);  // "'N' castles"
+	WFIFOL(fd, 110) = 0;  // zeny
+#else
+	safestrncpy(WFIFOP(fd, 70), msg_sd(sd, 300 + guild->checkcastles(g)), 16);  // "'N' castles"
+	WFIFOL(fd, 86) = 0;  // zeny
+	WFIFOL(fd, 90) = g->member[0].char_id;  // leader
+#endif
 
-	safestrncpy(WFIFOP(fd,94),msg_sd(sd,300+guild->checkcastles(g)),16); // "'N' castles"
-	WFIFOL(fd,110) = 0;  // zeny
-
-	WFIFOSET(fd,packet_len(0x1b6));
+	WFIFOSET(fd, packet_len(cmd));
 }
 
 /// Guild alliance and opposition list (ZC_MYGUILD_BASIC_INFO).
@@ -7504,35 +7596,47 @@ void clif_guild_memberlist(struct map_session_data *sd)
 	int fd;
 	int i,c;
 	struct guild *g;
+#if PACKETVER < 20161026
+	const int cmd = 0x154;
+	const int size = 104;
+#else
+	const int cmd = 0xaa5;
+	const int size = 34;
+#endif
+
 	nullpo_retv(sd);
 
-	if( (fd = sd->fd) == 0 )
+	if ((fd = sd->fd) == 0)
 		return;
-	if( (g = sd->guild) == NULL )
+	if ((g = sd->guild) == NULL)
 		return;
 
-	WFIFOHEAD(fd, g->max_member * 104 + 4);
-	WFIFOW(fd, 0)=0x154;
-	for(i=0,c=0;i<g->max_member;i++){
-		struct guild_member *m=&g->member[i];
-		if(m->account_id==0)
+	WFIFOHEAD(fd, g->max_member * size + 4);
+	WFIFOW(fd, 0) = cmd;
+	for (i = 0, c = 0; i < g->max_member; i++) {
+		struct guild_member *m = &g->member[i];
+		if (m->account_id == 0)
 			continue;
-		WFIFOL(fd,c*104+ 4)=m->account_id;
-		WFIFOL(fd,c*104+ 8)=m->char_id;
-		WFIFOW(fd,c*104+12)=m->hair;
-		WFIFOW(fd,c*104+14)=m->hair_color;
-		WFIFOW(fd,c*104+16)=m->gender;
-		WFIFOW(fd,c*104+18)=m->class;
-		WFIFOW(fd,c*104+20)=m->lv;
-		WFIFOL(fd,c*104+22)=(int)cap_value(m->exp,0,INT32_MAX);
-		WFIFOL(fd,c*104+26)=m->online;
-		WFIFOL(fd,c*104+30)=m->position;
-		memset(WFIFOP(fd,c*104+34),0,50); //[Ind] - This is displayed in the 'note' column but being you can't edit it it's sent empty.
-		memcpy(WFIFOP(fd,c*104+84),m->name,NAME_LENGTH);
+		WFIFOL(fd, c * size + 4) = m->account_id;
+		WFIFOL(fd, c * size + 8) = m->char_id;
+		WFIFOW(fd, c * size + 12) = m->hair;
+		WFIFOW(fd, c * size + 14) = m->hair_color;
+		WFIFOW(fd, c * size + 16) = m->gender;
+		WFIFOW(fd, c * size + 18) = m->class;
+		WFIFOW(fd, c * size + 20) = m->lv;
+		WFIFOL(fd, c * size + 22) = (int)cap_value(m->exp, 0, INT32_MAX);
+		WFIFOL(fd, c * size + 26) = m->online;
+		WFIFOL(fd, c * size + 30) = m->position;
+#if PACKETVER < 20161026
+		memset(WFIFOP(fd, c * size + 34), 0, 50);  //[Ind] - This is displayed in the 'note' column but being you can't edit it it's sent empty.
+		memcpy(WFIFOP(fd, c * size + 84), m->name, NAME_LENGTH);
+#else
+		WFIFOL(fd, c * size + 34) = 0;  // [4144] this is member last login time. But in hercules it not present.
+#endif
 		c++;
 	}
-	WFIFOW(fd, 2)=c*104+4;
-	WFIFOSET(fd,WFIFOW(fd,2));
+	WFIFOW(fd, 2) = c * size + 4;
+	WFIFOSET(fd, WFIFOW(fd, 2));
 }
 
 /// Guild position name information (ZC_POSITION_ID_NAME_INFO).
@@ -12953,13 +13057,22 @@ void clif_parse_GuildChangeMemberPosition(int fd, struct map_session_data *sd) _
 void clif_parse_GuildChangeMemberPosition(int fd, struct map_session_data *sd)
 {
 	int i;
+	int len = RFIFOW(fd, 2);
 
 	if(!sd->state.gmaster_flag)
 		return;
 
+	// Guild leadership change
+	if (len == 16 && RFIFOL(fd, 12) == 0) {
+		guild->gm_change(sd->status.guild_id, RFIFOL(fd, 8));
+		return;
+	}
+
 	for(i=4;i<RFIFOW(fd,2);i+=12){
-		guild->change_memberposition(sd->status.guild_id,
-			RFIFOL(fd,i),RFIFOL(fd,i+4),RFIFOL(fd,i+8));
+		int position = RFIFOL(fd, i + 8);
+		if (position > 0) {
+			guild->change_memberposition(sd->status.guild_id, RFIFOL(fd, i), RFIFOL(fd, i + 4), position);
+		}
 	}
 }
 
@@ -17614,7 +17727,7 @@ void clif_cashshop_db(void) {
 	if( cashshop != NULL && (cats = libconfig->setting_get_elem(cashshop, 0)) != NULL ) {
 		for(i = 0; i < CASHSHOP_TAB_MAX; i++) {
 			struct config_setting_t *cat;
-			char entry_name[10];
+			char entry_name[15];
 
 			sprintf(entry_name,"cat_%d",i);
 
@@ -19114,6 +19227,494 @@ unsigned short clif_parse_cmd_optional( int fd, struct map_session_data *sd ) {
 }
 
 /*==========================================
+ * RoDEX
+ *------------------------------------------*/
+
+void clif_parse_rodex_open_write_mail(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_open_write_mail(int fd, struct map_session_data *sd)
+{
+	const struct PACKET_CZ_REQ_OPEN_WRITE_MAIL *rPacket = RFIFOP(fd, 0);
+	int8 result = (rodex->isenabled() == true) ? 1 : 0;
+	
+	clif->rodex_open_write_mail(fd, rPacket->receiveName, result);
+}
+
+void clif_rodex_open_write_mail(int fd, const char *receiver_name, int8 result)
+{
+#if PACKETVER >= 20140416
+	struct PACKET_ZC_ACK_OPEN_WRITE_MAIL *sPacket = NULL;
+	
+	nullpo_retv(receiver_name);
+
+	WFIFOHEAD(fd, sizeof(*sPacket));
+	sPacket = WFIFOP(fd, 0);
+	sPacket->PacketType = rodexopenwrite;
+	strncpy(sPacket->receiveName, receiver_name, NAME_LENGTH);
+	sPacket->result = result;
+	WFIFOSET(fd, sizeof(*sPacket));
+#endif
+}
+
+void clif_parse_rodex_add_item(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_add_item(int fd, struct map_session_data *sd)
+{
+	const struct PACKET_CZ_ADD_ITEM_TO_MAIL *rPacket = RFIFOP(fd, 0);
+	int16 idx = rPacket->index - 2;
+
+	rodex->add_item(sd, idx, (int16)rPacket->count);
+}
+
+void clif_rodex_add_item_result(struct map_session_data *sd, int16 idx, int16 amount, int8 result)
+{
+#if PACKETVER >= 20140416
+	struct PACKET_ZC_ADD_ITEM_TO_MAIL *packet;
+	int fd, j;
+
+	nullpo_retv(sd);
+	if (idx < 0 || idx >= MAX_INVENTORY)
+		result = RODEX_ADD_ITEM_FATAL_ERROR;
+
+	fd = sd->fd;
+
+	WFIFOHEAD(fd, sizeof(*packet));
+	packet = WFIFOP(fd, 0);
+	memset(packet, 0x0, sizeof(*packet));
+	packet->PacketType = rodexadditem;
+	packet->result = result;
+
+	if (result != RODEX_ADD_ITEM_SUCCESS) { //No need to continue building the packet if it failed
+		WFIFOSET(fd, sizeof(*packet));
+		return;
+	}
+
+	packet->index = idx + 2;
+	packet->count = amount;
+	packet->ITID = sd->status.inventory[idx].nameid;
+	packet->type = itemtype(sd->inventory_data[idx]->type);
+	packet->IsIdentified = sd->status.inventory[idx].identify ? 1 : 0;
+	packet->IsDamaged = (sd->status.inventory[idx].attribute & ATTR_BROKEN) != 0 ? 1 : 0;
+	packet->refiningLevel = sd->status.inventory[idx].refine;
+	for (j = 0; j < ARRAYLENGTH(packet->slot.card); ++j)
+		packet->slot.card[j] = sd->status.inventory[idx].card[j];
+	for (j = 0; j < MAX_ITEM_OPTIONS; ++j) {
+		packet->optionData[j].index = sd->status.inventory[idx].option[j].index;
+		packet->optionData[j].param = sd->status.inventory[idx].option[j].param;
+		packet->optionData[j].value = sd->status.inventory[idx].option[j].value;
+	}
+	packet->weight = sd->rodex.tmp.weight / 10;
+	WFIFOSET(fd, sizeof(*packet));
+#endif
+}
+
+void clif_parse_rodex_remove_item(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_remove_item(int fd, struct map_session_data *sd)
+{
+	const struct PACKET_CZ_REQ_REMOVE_ITEM_MAIL *rPacket = RFIFOP(fd, 0);
+	int16 idx = rPacket->index - 2;
+
+	rodex->remove_item(sd, idx, (int16)rPacket->cnt);
+}
+
+void clif_rodex_remove_item_result(struct map_session_data *sd, int16 idx, int16 amount)
+{
+#if PACKETVER >= 20140521
+	struct PACKET_ZC_ACK_REMOVE_ITEM_MAIL *packet;
+	int fd;
+
+	nullpo_retv(sd);
+	Assert_retv(idx >= 0 && idx < MAX_INVENTORY);
+
+	fd = sd->fd;
+
+	WFIFOHEAD(fd, sizeof(*packet));
+	packet = WFIFOP(fd, 0);
+	packet->PacketType = rodexremoveitem;
+	packet->result = (amount < 0) ? 0 : 1;
+	packet->cnt = (amount < 0) ? 0 : sd->status.inventory[idx].amount - amount;
+	packet->index = idx + 2;
+	packet->weight = sd->rodex.tmp.weight / 10;
+	WFIFOSET(fd, sizeof(*packet));
+#endif
+}
+
+void clif_parse_rodex_checkname(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_checkname(int fd, struct map_session_data *sd)
+{
+	const struct PACKET_CZ_CHECKNAME *rPacket = RFIFOP(fd, 0);
+	int char_id = 0, base_level = 0;
+	short class = 0;
+	char name[NAME_LENGTH];
+	
+	safestrncpy(name, rPacket->Name, NAME_LENGTH);
+
+	rodex->check_player(sd, name, &base_level, &char_id, &class);
+}
+
+void clif_rodex_checkname_result(struct map_session_data *sd, int char_id, short class_, int base_level, const char *name)
+{
+#if PACKETVER >= 20140521
+	struct PACKET_ZC_CHECKNAME *sPacket;
+	int fd;
+
+	nullpo_retv(sd);
+	nullpo_retv(name);
+
+	fd = sd->fd;
+	WFIFOHEAD(fd, sizeof(*sPacket));
+	sPacket = WFIFOP(fd, 0);
+	sPacket->PacketType = rodexcheckplayer;
+	if (char_id == 0) {
+		sPacket->CharId = 0;
+		WFIFOSET(fd, sizeof(*sPacket));
+		return;
+	}
+	sPacket->CharId = char_id;
+	sPacket->Class = class_;
+	sPacket->BaseLevel = base_level;
+#if PACKETVER >= 20160316
+	strncpy(sPacket->Name, name, NAME_LENGTH);
+#endif
+	WFIFOSET(fd, sizeof(*sPacket));
+#endif
+}
+
+void clif_parse_rodex_send_mail(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_send_mail(int fd, struct map_session_data *sd)
+{
+	const struct PACKET_CZ_SEND_MAIL *rPacket = RFIFOP(fd, 0);
+	int8 result;
+
+	if (rPacket->TextcontentsLength + rPacket->Titlelength > rPacket->PacketLength - sizeof(*rPacket)) {
+		result = RODEX_SEND_MAIL_FATAL_ERROR;
+	} else if (rPacket->TextcontentsLength > RODEX_BODY_LENGTH || rPacket->Titlelength > RODEX_TITLE_LENGTH) {
+		result = RODEX_SEND_MAIL_FATAL_ERROR;
+	} else {
+		char rname[NAME_LENGTH] = "";
+		char title[RODEX_TITLE_LENGTH] = "";
+		char body[RODEX_BODY_LENGTH] = "";
+
+		safestrncpy(rname, rPacket->receiveName, NAME_LENGTH);
+		safestrncpy(title, rPacket->string, RODEX_TITLE_LENGTH);
+		safestrncpy(body, &rPacket->string[rPacket->Titlelength], RODEX_BODY_LENGTH);
+
+		result = rodex->send_mail(sd, rname, body, title, rPacket->zeny);
+	}
+
+	if (result != RODEX_SEND_MAIL_SUCCESS)
+		clif->rodex_send_mail_result(fd, sd, result);
+	rodex->clean(sd, 1);
+}
+
+void clif_rodex_send_mail_result(int fd, struct map_session_data *sd, int8 result)
+{
+#if PACKETVER >= 20131230
+	struct PACKET_ZC_WRITE_MAIL_RESULT *sPacket;
+
+	WFIFOHEAD(fd, sizeof(*sPacket));
+	sPacket = WFIFOP(fd, 0);
+	sPacket->PacketType = rodexwriteresult;
+	sPacket->result = result;
+	WFIFOSET(fd, sizeof(*sPacket));
+#endif
+}
+
+void clif_rodex_send_maillist(int fd, struct map_session_data *sd, int8 open_type, int64 page_start)
+{
+#if PACKETVER >= 20131218
+	struct PACKET_ZC_MAIL_LIST *packet;
+	struct maillistinfo *inner;
+	int16 size = sizeof(*packet);
+	int8 count = 0;
+
+	nullpo_retv(sd);
+
+	WFIFOHEAD(fd, sizeof(*packet) + (sizeof(*inner) + RODEX_TITLE_LENGTH) * 7);
+	packet = WFIFOP(fd, 0);
+	packet->PacketType = ((page_start == (VECTOR_LENGTH(sd->rodex.messages) - 1)) ? rodexmailList : rodexnextpage);
+	packet->opentype = open_type;
+
+	inner = WFIFOP(fd, size);
+
+	while (page_start >= 0 && count < RODEX_MAIL_PER_PAGE) {
+		struct rodex_message *msg = &VECTOR_INDEX(sd->rodex.messages, page_start);
+		--page_start;
+
+		if (msg->is_deleted)
+			continue;
+
+		inner->MailID = msg->id;
+		inner->Isread = msg->is_read == true ? 1 : 0;
+		inner->type = msg->type;
+		inner->regDateTime = (int)time(NULL) - msg->send_date;
+		inner->expireDateTime = msg->expire_date - (int)time(NULL);
+		if (open_type == RODEX_OPENTYPE_RETURN) {
+			inner->expireDateTime += RODEX_EXPIRE;
+		}
+		inner->Titlelength = (int16)strlen(msg->title) + 1;
+		if (open_type != RODEX_OPENTYPE_RETURN) {
+			strncpy(inner->SenderName, msg->sender_name, sizeof(msg->sender_name));
+		} else {
+			strncpy(inner->SenderName, msg->receiver_name, sizeof(msg->receiver_name));
+		}
+		strncpy(inner->title, msg->title, inner->Titlelength);
+		size += sizeof(*inner) + inner->Titlelength;
+		inner = WFIFOP(fd, size);
+		++count;
+	}
+
+	packet->PacketLength = size;
+	packet->cnt = count;
+	packet->IsEnd = page_start > 0 ? 0 : 1;
+	WFIFOSET(fd, size);
+#endif
+}
+
+void clif_rodex_send_refresh(int fd, struct map_session_data *sd, int8 open_type, int count)
+{
+#if PACKETVER >= 20131218
+	struct PACKET_ZC_MAIL_LIST *packet;
+	struct maillistinfo *inner;
+	int16 size = sizeof(*packet);
+	int i, j;
+
+	nullpo_retv(sd);
+
+	WFIFOHEAD(fd, sizeof(*packet) + (sizeof(*inner) + RODEX_TITLE_LENGTH) * 7);
+	packet = WFIFOP(fd, 0);
+	packet->PacketType = rodexmailList;
+	packet->opentype = open_type;
+
+	inner = WFIFOP(fd, size);
+
+	i = VECTOR_LENGTH(sd->rodex.messages) - 1;
+	j = count;
+	while (i >= 0 && j > 0) {
+		struct rodex_message *msg = &VECTOR_INDEX(sd->rodex.messages, i);
+		--i;
+
+		if (msg->is_deleted)
+			continue;
+
+		inner->MailID = msg->id;
+		inner->Isread = msg->is_read == true ? 1 : 0;
+		inner->type = msg->type;
+		inner->regDateTime = (int)time(NULL) - msg->send_date;
+		inner->expireDateTime = msg->expire_date - (int)time(NULL);
+		if (open_type == RODEX_OPENTYPE_RETURN) {
+			inner->expireDateTime += RODEX_EXPIRE;
+		}
+		inner->Titlelength = (int16)strlen(msg->title) + 1;
+		if (open_type != RODEX_OPENTYPE_RETURN) {
+			strncpy(inner->SenderName, msg->sender_name, sizeof(msg->sender_name));
+		} else {
+			strncpy(inner->SenderName, msg->receiver_name, sizeof(msg->receiver_name));
+		}
+		strncpy(inner->title, msg->title, inner->Titlelength);
+		size += sizeof(*inner) + inner->Titlelength;
+		inner = WFIFOP(fd, size);
+		--j;
+	}
+
+	packet->PacketLength = size;
+	packet->cnt = count;
+	packet->IsEnd = 1;
+	WFIFOSET(fd, size);
+#endif
+}
+
+void clif_parse_rodex_next_maillist(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_next_maillist(int fd, struct map_session_data *sd)
+{
+	const struct PACKET_CZ_REQ_NEXT_MAIL_LIST *packet = RFIFOP(fd, 0);
+
+	rodex->next_page(sd, packet->opentype, packet->Lower_MailID);
+}
+
+void clif_parse_rodex_read_mail(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_read_mail(int fd, struct map_session_data *sd)
+{
+	const struct PACKET_CZ_REQ_READ_MAIL *rPacket = RFIFOP(fd, 0);
+
+	rodex->read_mail(sd, rPacket->MailID);
+}
+
+void clif_rodex_read_mail(struct map_session_data *sd, int8 opentype, struct rodex_message *msg)
+{
+#if PACKETVER >= 20131223
+	struct PACKET_ZC_READ_MAIL *sPacket;
+	struct mail_item *item;
+	int fd, i, body_len, size;
+
+	nullpo_retv(sd);
+	nullpo_retv(msg);
+	
+	fd = sd->fd;
+	body_len = (int)strlen(msg->body) + 1;
+	size = sizeof(*sPacket);
+
+	WFIFOHEAD(fd, sizeof(*sPacket) + body_len + (sizeof(*item) * RODEX_MAX_ITEM));
+	sPacket = WFIFOP(fd, 0);
+	sPacket->PacketType = rodexread;
+	sPacket->opentype = opentype;
+	sPacket->MailID = msg->id;
+	sPacket->TextcontentsLength = body_len;
+	sPacket->zeny = msg->zeny;
+	sPacket->ItemCnt = msg->items_count;
+	strncpy(WFIFOP(fd, size), msg->body, body_len);
+	size += body_len;
+	for (i = 0; i < RODEX_MAX_ITEM; ++i) {
+		struct item *it = &msg->items[i].item;
+		int j, k;
+
+		if (it->nameid == 0) {
+			continue;
+		}
+
+		item = WFIFOP(fd, size);
+		memset(item, 0x0, sizeof(*item));
+		item->ITID = it->nameid;
+		item->count = it->amount;
+		item->type = itemtype(itemdb->search(it->nameid)->type);
+		item->IsIdentified = it->identify ? 1 : 0;
+		item->IsDamaged = (it->attribute & ATTR_BROKEN) != 0 ? 1 : 0;
+		item->refiningLevel = it->refine;
+		for (k = 0; k < MAX_SLOTS; ++k) {
+			item->slot.card[k] = it->card[k];
+		}
+		for (j = 0; j < MAX_ITEM_OPTIONS; ++j) {
+			item->optionData[j].index = it->option[j].index;
+			item->optionData[j].value = it->option[j].value;
+		}
+
+		size += sizeof(*item);
+	}
+	sPacket->PacketLength = size;
+	WFIFOSET(fd, size);
+#endif
+}
+
+void clif_parse_rodex_delete_mail(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_delete_mail(int fd, struct map_session_data *sd)
+{
+	const struct PACKET_CZ_REQ_DELETE_MAIL *rPacket = RFIFOP(fd, 0);
+
+	rodex->delete_mail(sd, rPacket->MailID);
+}
+
+void clif_rodex_delete_mail(struct map_session_data *sd, int8 opentype, int64 mail_id)
+{
+#if PACKETVER >= 20131218
+	struct PACKET_ZC_ACK_DELETE_MAIL *sPacket;
+	int fd;
+
+	nullpo_retv(sd);
+
+	fd = sd->fd;
+
+	WFIFOHEAD(fd, sizeof(*sPacket));
+	sPacket = WFIFOP(fd, 0);
+	sPacket->PacketType = rodexdelete;
+	sPacket->opentype = opentype;
+	sPacket->MailID = mail_id;
+	WFIFOSET(fd, sizeof(*sPacket));
+#endif
+}
+
+void clif_parse_rodex_request_zeny(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_request_zeny(int fd, struct map_session_data *sd)
+{
+	const struct PACKET_CZ_REQ_ZENY_FROM_MAIL *rPacket = RFIFOP(fd, 0);
+	
+	rodex->get_zeny(sd, rPacket->opentype, rPacket->MailID);
+}
+
+void clif_rodex_request_zeny(struct map_session_data *sd, int8 opentype, int64 mail_id, int8 result)
+{
+#if PACKETVER >= 20140409
+	struct PACKET_ZC_ACK_ZENY_FROM_MAIL *sPacket;
+	int fd;
+
+	nullpo_retv(sd);
+
+	fd = sd->fd;
+
+	WFIFOHEAD(fd, sizeof(*sPacket));
+	sPacket = WFIFOP(fd, 0);
+	sPacket->PacketType = rodexgetzeny;
+	sPacket->MailID = mail_id;
+	sPacket->opentype = opentype;
+	sPacket->result = result;
+	WFIFOSET(fd, sizeof(*sPacket));
+#endif
+}
+
+void clif_parse_rodex_request_items(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_request_items(int fd, struct map_session_data *sd)
+{
+	const struct PACKET_CZ_REQ_ITEM_FROM_MAIL *rPacket = RFIFOP(fd, 0);
+
+	rodex->get_items(sd, rPacket->opentype, rPacket->MailID);
+}
+
+void clif_rodex_request_items(struct map_session_data *sd, int8 opentype, int64 mail_id, int8 result)
+{
+#if PACKETVER >= 20140409
+	struct PACKET_ZC_ACK_ITEM_FROM_MAIL *sPacket;
+	int fd;
+
+	nullpo_retv(sd);
+
+	fd = sd->fd;
+	
+	WFIFOHEAD(fd, sizeof(*sPacket));
+	sPacket = WFIFOP(fd, 0);
+	sPacket->PacketType = rodexgetitem;
+	sPacket->MailID = mail_id;
+	sPacket->opentype = opentype;
+	sPacket->result = result;
+	WFIFOSET(fd, sizeof(*sPacket));
+#endif
+}
+
+void clif_rodex_icon(int fd, bool show)
+{
+#if PACKETVER >= 20140716
+	WFIFOHEAD(fd, 3);
+	WFIFOW(fd, 0) = rodexicon;
+	WFIFOB(fd, 2) = (show == true ? 1 : 0);
+	WFIFOSET(fd, 3);
+#endif
+}
+
+void clif_parse_rodex_refresh_maillist(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_refresh_maillist(int fd, struct map_session_data *sd)
+{
+	const struct PACKET_CZ_REQ_REFRESH_MAIL_LIST *packet = RFIFOP(fd, 0);
+	rodex->refresh(sd, packet->opentype, packet->Upper_MailID);
+}
+
+void clif_parse_rodex_open_mailbox(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_open_mailbox(int fd, struct map_session_data *sd)
+{
+	const struct PACKET_CZ_REQ_OPEN_MAIL *packet = RFIFOP(fd, 0);
+	rodex->open(sd, packet->opentype);
+	rodex->clean(sd, 1);
+}
+
+void clif_parse_rodex_close_mailbox(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_close_mailbox(int fd, struct map_session_data *sd)
+{
+	rodex->clean(sd, 0);
+	intif->rodex_checkhasnew(sd);
+}
+
+void clif_parse_rodex_cancel_write_mail(int fd, struct map_session_data *sd) __attribute__((nonnull(2)));
+void clif_parse_rodex_cancel_write_mail(int fd, struct map_session_data *sd)
+{
+	rodex->clean(sd, 1);
+}
+
+/*==========================================
  * Main client packet processing function
  *------------------------------------------*/
 int clif_parse(int fd) {
@@ -19702,6 +20303,7 @@ void clif_defaults(void) {
 	clif->party_created = clif_party_created;
 	clif->party_member_info = clif_party_member_info;
 	clif->party_info = clif_party_info;
+	clif->party_job_and_level = clif_party_job_and_level;
 	clif->party_invite = clif_party_invite;
 	clif->party_inviteack = clif_party_inviteack;
 	clif->party_option = clif_party_option;
@@ -20152,4 +20754,31 @@ void clif_defaults(void) {
 	clif->dressroom_open = clif_dressroom_open;
 	clif->pOneClick_ItemIdentify = clif_parse_OneClick_ItemIdentify;
 	clif->get_bl_name = clif_get_bl_name;
+	/* RODEX */
+	clif->pRodexOpenWriteMail = clif_parse_rodex_open_write_mail;
+	clif->rodex_open_write_mail = clif_rodex_open_write_mail;
+	clif->pRodexAddItem = clif_parse_rodex_add_item;
+	clif->rodex_add_item_result = clif_rodex_add_item_result;
+	clif->pRodexRemoveItem = clif_parse_rodex_remove_item;
+	clif->rodex_remove_item_result = clif_rodex_remove_item_result;
+	clif->pRodexSendMail = clif_parse_rodex_send_mail;
+	clif->rodex_send_mail_result = clif_rodex_send_mail_result;
+	clif->rodex_send_maillist = clif_rodex_send_maillist;
+	clif->rodex_send_refresh = clif_rodex_send_refresh;
+	clif->pRodexReadMail = clif_parse_rodex_read_mail;
+	clif->rodex_read_mail = clif_rodex_read_mail;
+	clif->pRodexNextMaillist = clif_parse_rodex_next_maillist;
+	clif->pRodexCloseMailbox = clif_parse_rodex_close_mailbox;
+	clif->pRodexCancelWriteMail = clif_parse_rodex_cancel_write_mail;
+	clif->pRodexOpenMailbox = clif_parse_rodex_open_mailbox;
+	clif->pRodexCheckName = clif_parse_rodex_checkname;
+	clif->rodex_checkname_result = clif_rodex_checkname_result;
+	clif->pRodexDeleteMail = clif_parse_rodex_delete_mail;
+	clif->rodex_delete_mail = clif_rodex_delete_mail;
+	clif->pRodexRefreshMaillist = clif_parse_rodex_refresh_maillist;
+	clif->pRodexRequestZeny = clif_parse_rodex_request_zeny;
+	clif->rodex_request_zeny = clif_rodex_request_zeny;
+	clif->pRodexRequestItems = clif_parse_rodex_request_items;
+	clif->rodex_request_items = clif_rodex_request_items;
+	clif->rodex_icon = clif_rodex_icon;
 }
